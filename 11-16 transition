@@ -1,0 +1,94 @@
+def run_univariate_logit_with_ame(df, g_from, g_to, top_k=160, save_tag="group_from_to"):
+    # 1) срез по переходу
+    df_sub = df[df['group'].isin([g_from, g_to])].copy()
+    df_sub['target'] = (df_sub['group'] == g_to).astype(int)
+
+    # 2) кандидаты
+    exclude_cols = ['country', 'year', 'group', 'target']
+    variable_list = [col for col in df_sub.columns if col not in exclude_cols]
+
+    results = []
+    mini_rows = []  # для мини-таблицы OR -> Δp ( п.п. ) с ДИ
+
+    for var in variable_list:
+        try:
+            # 3) дропаут NA по конкретной переменной
+            temp_df = df_sub[[var, 'target']].dropna()
+
+            # пропускаем константные
+            if temp_df[var].nunique() <= 1:
+                continue
+
+            X = sm.add_constant(temp_df[[var]])
+            y = temp_df['target']
+
+            model = sm.Logit(y, X)
+            result = model.fit(disp=0)
+
+            # коэффициенты и OR
+            coef = result.params[var]
+            pval = result.pvalues[var]
+            odds_ratio = float(np.exp(coef))
+
+            # 4) AME (средний маржинальный эффект) + 95% ДИ
+            # get_margeff(at='overall') даёт средние частные эффекты по выборке; ДИ по delta method
+            mfx = result.get_margeff(at='overall')  # по умолчанию method='dydx'
+            mfx_df = mfx.summary_frame()  # содержит dy/dx, std err, conf int
+            # иногда имена фич в индексе: берём строку по имени var
+            if var in mfx_df.index:
+                ame = float(mfx_df.loc[var, 'dy/dx'])
+                se  = float(mfx_df.loc[var, 'Std. Err.'])
+            else:
+                # fallback: берём первую ненулевую строку
+                ame = float(mfx.margeff[0])
+                se  = float(mfx.margeff_se[0])
+
+            ci_low = ame - 1.96 * se
+            ci_high = ame + 1.96 * se
+
+            # в процентных пунктах
+            ame_pp = ame * 100.0
+            ci_low_pp = ci_low * 100.0
+            ci_high_pp = ci_high * 100.0
+
+            results.append({
+                'Variable': var,
+                'Coefficient': coef,
+                'P-value': pval,
+                'Odds Ratio': odds_ratio,
+                'AME (probability)': ame,
+                'AME 95% CI low': ci_low,
+                'AME 95% CI high': ci_high
+            })
+
+        except Exception as e:
+            print(f"Skipping {var} due to error: {e}")
+            continue
+
+    # 5) общий фрейм результатов и сохранение
+    results_df = pd.DataFrame(results)
+
+    if results_df.empty:
+        print(f"No valid results for transition {g_from}->{g_to}")
+        return None, None
+
+    # сортировка по величине вклада: используем коэффициент (можно заменить на OR при желании)
+    results_df = results_df.sort_values('Coefficient', ascending=False).reset_index(drop=True)
+
+    # сохраним полный список
+    full_path = out_dir + f"univariate_logit_{save_tag}.xlsx"
+    results_df.to_excel(full_path, index=False)
+
+    return results_df
+
+# --- Загрузка данных ---
+df = pd.read_excel(file_path)
+
+# === ПРИМЕР: Переход «pre-industrial → early industrialization» (Group 11 -> Group 16) ===
+results_11_16 = run_univariate_logit_with_ame(
+    df=df,
+    g_from=11,
+    g_to=16,
+    top_k=160,
+    save_tag="group11_to_16"
+)
